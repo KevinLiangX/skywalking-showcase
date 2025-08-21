@@ -71,15 +71,15 @@ jobs:
         file: ${{ steps.parse-command.outputs.dockerfile }}
         push: true
         tags: |
-          ${{ secrets.ALIYUN_REGISTRY }}/${{ secrets.ALIYUN_NAMESPACE }}/${{ steps.parse-command.outputs.service }}:${{ steps.parse-command.outputs.tag }}
-          ${{ secrets.ALIYUN_REGISTRY }}/${{ secrets.ALIYUN_NAMESPACE }}/${{ steps.parse-command.outputs.service }}:latest
+          registry.cn-hangzhou.aliyuncs.com/imagefiles/${{ steps.parse-command.outputs.service }}:${{ steps.parse-command.outputs.tag }}
+          registry.cn-hangzhou.aliyuncs.com/imagefiles/${{ steps.parse-command.outputs.service }}:latest
         
     - name: Add build comment
       uses: actions/github-script@v7
       env:
         SERVICE: ${{ steps.parse-command.outputs.service }}
         TAG: ${{ steps.parse-command.outputs.tag }}
-        IMAGE_URL: ${{ secrets.ALIYUN_REGISTRY }}/${{ secrets.ALIYUN_NAMESPACE }}/${{ steps.parse-command.outputs.service }}:${{ steps.parse-command.outputs.tag }}
+        IMAGE_URL: registry.cn-hangzhou.aliyuncs.com/imagefiles/${{ steps.parse-command.outputs.service }}:${{ steps.parse-command.outputs.tag }}
       with:
         github-token: ${{ secrets.GITHUB_TOKEN }}
         script: |
