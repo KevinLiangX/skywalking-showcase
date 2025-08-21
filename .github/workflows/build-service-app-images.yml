@@ -33,17 +33,27 @@ jobs:
         # 设置默认值
         [[ -z "$SERVICE" ]] && SERVICE="app"
         [[ -z "$TAG" ]] && TAG="latest"
-        [[ -z "$DOCKERFILE" ]] && DOCKERFILE="$SERVICE/Dockerfile"
+        [[ -z "$DOCKERFILE" ]] && DOCKERFILE="Dockerfile"
         
-        # 验证服务目录是否存在
-        if [ ! -d "$SERVICE" ]; then
-          echo "::error ::服务目录 '$SERVICE' 不存在"
+        # 关键修复：根据Dockerfile路径自动推导上下文目录
+        CONTEXT_DIR=$(dirname "$DOCKERFILE")
+        
+        # 修复2：验证上下文目录（而非仅服务目录）
+        if [ ! -d "$CONTEXT_DIR" ]; then
+          echo "::error ::上下文目录 '$CONTEXT_DIR' 不存在"
+          exit 1
+        fi
+        
+        # 修复3：验证Dockerfile文件是否存在
+        if [ ! -f "$DOCKERFILE" ]; then
+          echo "::error ::Dockerfile '$DOCKERFILE' 不存在"
           exit 1
         fi
         
         echo "service=$SERVICE" >> $GITHUB_OUTPUT
         echo "tag=$TAG" >> $GITHUB_OUTPUT
         echo "dockerfile=$DOCKERFILE" >> $GITHUB_OUTPUT
+        echo "context_dir=$CONTEXT_DIR" >> $GITHUB_OUTPUT
 
     # 登录阿里云容器镜像服务
     - name: Login to Aliyun ACR
@@ -57,8 +67,8 @@ jobs:
     - name: Build and push Docker image
       uses: docker/build-push-action@v5
       with:
-        context: ./${{ steps.parse-command.outputs.service }}
-        file: ./${{ steps.parse-command.outputs.dockerfile }}
+        context: ${{ steps.parse-command.outputs.context_dir }}
+        file: ${{ steps.parse-command.outputs.dockerfile }}
         push: true
         tags: |
           ${{ secrets.ALIYUN_REGISTRY }}/${{ secrets.ALIYUN_NAMESPACE }}/${{ steps.parse-command.outputs.service }}:${{ steps.parse-command.outputs.tag }}
@@ -69,7 +79,6 @@ jobs:
       env:
         SERVICE: ${{ steps.parse-command.outputs.service }}
         TAG: ${{ steps.parse-command.outputs.tag }}
-        # 关键修复：使用正确的镜像地址格式
         IMAGE_URL: ${{ secrets.ALIYUN_REGISTRY }}/${{ secrets.ALIYUN_NAMESPACE }}/${{ steps.parse-command.outputs.service }}:${{ steps.parse-command.outputs.tag }}
       with:
         github-token: ${{ secrets.GITHUB_TOKEN }}
