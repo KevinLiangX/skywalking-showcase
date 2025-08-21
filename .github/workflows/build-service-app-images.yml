@@ -81,7 +81,7 @@ jobs:
         TAG: ${{ steps.parse-command.outputs.tag }}
         IMAGE_URL: registry.cn-hangzhou.aliyuncs.com/imagefiles/${{ steps.parse-command.outputs.service }}:${{ steps.parse-command.outputs.tag }}
       with:
-        github-token: ${{ secrets.GITHUB_TOKEN }}
+        github-token: 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
         script: |
           github.rest.issues.createComment({
             issue_number: ${{ github.event.issue.number }},
