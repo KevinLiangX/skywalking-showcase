@@ -6,7 +6,6 @@ on:
 
 jobs:
   build-image:
-    # 仅处理以 "/build" 开头的评论
     if: |
       startsWith(github.event.comment.body, '/build') &&
       github.event.issue.pull_request == null
@@ -70,6 +69,7 @@ jobs:
       env:
         SERVICE: ${{ steps.parse-command.outputs.service }}
         TAG: ${{ steps.parse-command.outputs.tag }}
+        # 关键修复：使用正确的镜像地址格式
         IMAGE_URL: ${{ secrets.ALIYUN_REGISTRY }}/${{ secrets.ALIYUN_NAMESPACE }}/${{ steps.parse-command.outputs.service }}:${{ steps.parse-command.outputs.tag }}
       with:
         github-token: ${{ secrets.GITHUB_TOKEN }}
