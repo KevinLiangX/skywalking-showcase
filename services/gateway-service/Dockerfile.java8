@@ -1,0 +1,47 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+# 使用 Java 8 进行构建和运行
+# 多阶段构建：确保编译和运行使用相同的 Java 版本
+
+# 构建阶段 - 使用 Java 8 编译
+FROM openjdk:8-jdk-alpine AS builder
+
+WORKDIR /app
+
+# 复制项目文件
+COPY . .
+
+# 确保使用 Java 8 编译
+RUN ./gradlew build -Dorg.gradle.java.home=/usr/lib/jvm/java-1.8-openjdk --no-daemon
+
+# 运行阶段 - 使用 Java 8 运行时 + SkyWalking Agent
+FROM ghcr.io/apache/skywalking-java/skywalking-java:26ef911aea908759795bb6f5f2f6be56370d30cc-java8
+
+# 从构建阶段复制 JAR 文件
+COPY --from=builder /app/build/libs/gateway-service-0.0.1-SNAPSHOT.jar /app.jar
+
+# 启用 Spring Cloud Gateway 插件
+RUN mv /skywalking/agent/optional-plugins/apm-spring-cloud-gateway-3.x-plugin*.jar /skywalking/agent/plugins/
+
+# 设置 Java 8 环境变量
+ENV JAVA_HOME=/usr/lib/jvm/java-1.8-openjdk
+ENV PATH=$JAVA_HOME/bin:$PATH
+
+# 启动命令
+CMD ["java", "-jar", "/app.jar"]
