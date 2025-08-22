@@ -1,0 +1,384 @@
+name: Build and Push to Aliyun Container Registry
+
+on:
+  workflow_dispatch:  # 手动触发
+    inputs:
+      services:
+        description: '要构建的服务 (用逗号分隔，留空表示构建所有服务)'
+        required: false
+        default: 'all'
+      tag:
+        description: '镜像标签'
+        required: false
+        default: ''
+      push_to_registry:
+        description: '是否推送到阿里云容器服务'
+        required: true
+        default: true
+        type: boolean
+      
+  issue_comment:  # issue comment 触发
+    types: [created]
+
+env:
+  # 阿里云容器服务配置
+  ALIYUN_REGISTRY: registry.cn-hangzhou.aliyuncs.com
+  ALIYUN_NAMESPACE: skywalking-showcase  # 修改为您的命名空间
+  
+  # 构建配置
+  DOCKER_BUILDKIT: 1
+  BUILDKIT_PROGRESS: plain
+
+jobs:
+  # 检查触发条件
+  check-trigger:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+      services: ${{ steps.check.outputs.services }}
+      tag: ${{ steps.check.outputs.tag }}
+      push_enabled: ${{ steps.check.outputs.push_enabled }}
+      issue_number: ${{ steps.check.outputs.issue_number }}
+    steps:
+      - name: Check trigger conditions
+        id: check
+        run: |
+          # 默认值
+          SHOULD_RUN="false"
+          SERVICES="all"
+          TAG=""
+          PUSH_ENABLED="true"
+          ISSUE_NUMBER=""
+          
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # 手动触发
+            SHOULD_RUN="true"
+            SERVICES="${{ github.event.inputs.services }}"
+            TAG="${{ github.event.inputs.tag }}"
+            PUSH_ENABLED="${{ github.event.inputs.push_to_registry }}"
+            echo "🚀 手动触发构建"
+          elif [[ "${{ github.event_name }}" == "issue_comment" ]]; then
+            # issue comment 触发
+            COMMENT_BODY="${{ github.event.comment.body }}"
+            ISSUE_NUMBER="${{ github.event.issue.number }}"
+            
+            # 检查是否是有权限的用户
+            if [[ "${{ github.event.comment.author_association }}" == "OWNER" ]] || \
+               [[ "${{ github.event.comment.author_association }}" == "MEMBER" ]] || \
+               [[ "${{ github.event.comment.author_association }}" == "COLLABORATOR" ]]; then
+              
+              # 检查 comment 内容
+              if echo "$COMMENT_BODY" | grep -E "^/build-aliyun"; then
+                SHOULD_RUN="true"
+                echo "🎯 通过 issue comment 触发构建"
+                
+                # 解析参数
+                if echo "$COMMENT_BODY" | grep -E -- "--services"; then
+                  SERVICES=$(echo "$COMMENT_BODY" | sed -n 's/.*--services[= ]\([^ ]*\).*/\1/p')
+                fi
+                
+                if echo "$COMMENT_BODY" | grep -E -- "--tag"; then
+                  TAG=$(echo "$COMMENT_BODY" | sed -n 's/.*--tag[= ]\([^ ]*\).*/\1/p')
+                fi
+                
+                if echo "$COMMENT_BODY" | grep -E -- "--no-push"; then
+                  PUSH_ENABLED="false"
+                fi
+              fi
+            else
+              echo "❌ 用户没有权限触发构建"
+            fi
+          fi
+          
+          # 设置默认标签
+          if [[ -z "$TAG" ]]; then
+            TAG="$(date +%Y%m%d-%H%M%S)-$(echo ${{ github.sha }} | cut -c1-7)"
+          fi
+          
+          echo "should_run=${SHOULD_RUN}" >> $GITHUB_OUTPUT
+          echo "services=${SERVICES}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "push_enabled=${PUSH_ENABLED}" >> $GITHUB_OUTPUT
+          echo "issue_number=${ISSUE_NUMBER}" >> $GITHUB_OUTPUT
+          
+          echo "📋 构建配置:"
+          echo "  - 是否执行: ${SHOULD_RUN}"
+          echo "  - 服务: ${SERVICES}"
+          echo "  - 标签: ${TAG}"
+          echo "  - 推送: ${PUSH_ENABLED}"
+          echo "  - Issue: ${ISSUE_NUMBER}"
+
+  # 在 issue 中添加开始构建的评论
+  comment-start:
+    needs: check-trigger
+    if: needs.check-trigger.outputs.should_run == 'true' && needs.check-trigger.outputs.issue_number != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment on issue - Build started
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { issue_number } = context.payload;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ needs.check-trigger.outputs.issue_number }},
+              body: `## 🚀 构建开始
+              
+              **构建配置:**
+              - 🏷️ 标签: \`${{ needs.check-trigger.outputs.tag }}\`
+              - 📦 服务: \`${{ needs.check-trigger.outputs.services }}\`
+              - 📤 推送到阿里云: ${{ needs.check-trigger.outputs.push_enabled == 'true' && '✅' || '❌' }}
+              - 🔗 [查看构建进度](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+              
+              ⏳ 构建中，请稍候...`
+            });
+
+  # 构建和推送服务
+  build-and-push:
+    needs: [check-trigger, comment-start]
+    if: always() && needs.check-trigger.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJson(needs.check-trigger.outputs.services == 'all' && '["app", "gateway-service", "songs-service", "rating-service", "recommendation-service", "load-gen"]' || format('["{0}"]', needs.check-trigger.outputs.services)) }}
+    outputs:
+      results: ${{ steps.collect-results.outputs.results }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up Node.js (for frontend services)
+        if: matrix.service == 'app'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: 'services/app/frontend/package-lock.json'
+
+      - name: Set up Java (for Java services)
+        if: contains(fromJson('["gateway-service", "songs-service"]'), matrix.service)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '11'
+
+      - name: Set up Go (for Go services)
+        if: matrix.service == 'rating-service'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.19'
+
+      - name: Set up Python (for Python services)
+        if: contains(fromJson('["recommendation-service", "load-gen"]'), matrix.service)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Log in to Aliyun Container Registry
+        if: needs.check-trigger.outputs.push_enabled == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ALIYUN_REGISTRY }}
+          username: ${{ secrets.ALIYUN_REGISTRY_USERNAME }}
+          password: ${{ secrets.ALIYUN_REGISTRY_PASSWORD }}
+
+      - name: Build Docker images
+        id: build
+        env:
+          HUB: ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}
+          TAG: ${{ needs.check-trigger.outputs.tag }}
+        run: |
+          echo "🔨 构建服务: ${{ matrix.service }}"
+          echo "📦 镜像仓库: ${HUB}"
+          echo "🏷️ 镜像标签: ${TAG}"
+          
+          # 进入服务目录并构建
+          cd services/${{ matrix.service }}
+          
+          # 设置构建结果输出
+          BUILD_SUCCESS="false"
+          BUILT_IMAGES=""
+          
+          if make docker.build; then
+            BUILD_SUCCESS="true"
+            echo "✅ ${{ matrix.service }} 构建成功"
+            
+            # 收集构建的镜像信息
+            case "${{ matrix.service }}" in
+              "app")
+                BUILT_IMAGES="${HUB}/frontend:${TAG},${HUB}/server:${TAG}"
+                if docker images | grep -q "${HUB}/frontend.*${TAG}-agentless"; then
+                  BUILT_IMAGES="${BUILT_IMAGES},${HUB}/frontend:${TAG}-agentless"
+                fi
+                if docker images | grep -q "${HUB}/server.*${TAG}-agentless"; then
+                  BUILT_IMAGES="${BUILT_IMAGES},${HUB}/server:${TAG}-agentless"
+                fi
+                ;;
+              *)
+                BUILT_IMAGES="${HUB}/${{ matrix.service }}:${TAG}"
+                if docker images | grep -q "${HUB}/${{ matrix.service }}.*${TAG}-agentless"; then
+                  BUILT_IMAGES="${BUILT_IMAGES},${HUB}/${{ matrix.service }}:${TAG}-agentless"
+                fi
+                ;;
+            esac
+          else
+            echo "❌ ${{ matrix.service }} 构建失败"
+          fi
+          
+          echo "build_success=${BUILD_SUCCESS}" >> $GITHUB_OUTPUT
+          echo "built_images=${BUILT_IMAGES}" >> $GITHUB_OUTPUT
+
+      - name: Push Docker images
+        if: steps.build.outputs.build_success == 'true' && needs.check-trigger.outputs.push_enabled == 'true'
+        id: push
+        env:
+          HUB: ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}
+          TAG: ${{ needs.check-trigger.outputs.tag }}
+        run: |
+          echo "📤 推送服务: ${{ matrix.service }}"
+          
+          cd services/${{ matrix.service }}
+          
+          PUSH_SUCCESS="false"
+          PUSHED_IMAGES=""
+          
+          if make docker.push; then
+            PUSH_SUCCESS="true"
+            PUSHED_IMAGES="${{ steps.build.outputs.built_images }}"
+            echo "✅ ${{ matrix.service }} 推送成功"
+          else
+            echo "❌ ${{ matrix.service }} 推送失败"
+          fi
+          
+          echo "push_success=${PUSH_SUCCESS}" >> $GITHUB_OUTPUT
+          echo "pushed_images=${PUSHED_IMAGES}" >> $GITHUB_OUTPUT
+
+      - name: Collect results
+        id: collect-results
+        run: |
+          SERVICE_RESULT="{"
+          SERVICE_RESULT="${SERVICE_RESULT}\"service\":\"${{ matrix.service }}\","
+          SERVICE_RESULT="${SERVICE_RESULT}\"build_success\":${{ steps.build.outputs.build_success }},"
+          
+          if [[ "${{ needs.check-trigger.outputs.push_enabled }}" == "true" ]]; then
+            SERVICE_RESULT="${SERVICE_RESULT}\"push_success\":${{ steps.push.outputs.push_success || false }},"
+            SERVICE_RESULT="${SERVICE_RESULT}\"images\":\"${{ steps.push.outputs.pushed_images || steps.build.outputs.built_images }}\""
+          else
+            SERVICE_RESULT="${SERVICE_RESULT}\"push_success\":null,"
+            SERVICE_RESULT="${SERVICE_RESULT}\"images\":\"${{ steps.build.outputs.built_images }}\""
+          fi
+          SERVICE_RESULT="${SERVICE_RESULT}}"
+          
+          echo "results=${SERVICE_RESULT}" >> $GITHUB_OUTPUT
+
+  # 汇总构建结果并评论
+  build-summary:
+    needs: [check-trigger, build-and-push]
+    if: always() && needs.check-trigger.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prepare summary
+        id: summary
+        run: |
+          echo "## 📊 构建结果汇总" > summary.md
+          echo "" >> summary.md
+          echo "**构建配置:**" >> summary.md
+          echo "- 🏷️ 标签: \`${{ needs.check-trigger.outputs.tag }}\`" >> summary.md
+          echo "- 📦 服务: \`${{ needs.check-trigger.outputs.services }}\`" >> summary.md
+          echo "- 📤 推送到阿里云: ${{ needs.check-trigger.outputs.push_enabled == 'true' && '✅ 是' || '❌ 否' }}" >> summary.md
+          echo "- 🏭 镜像仓库: \`${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}\`" >> summary.md
+          echo "" >> summary.md
+          
+          # 分析构建结果
+          TOTAL_SERVICES=0
+          SUCCESS_SERVICES=0
+          FAILED_SERVICES=""
+          BUILT_IMAGES=""
+          
+          # 这里需要解析每个服务的结果
+          # 由于 GitHub Actions 的限制，我们使用简化的方式
+          echo "### 🔨 构建状态" >> summary.md
+          echo "" >> summary.md
+          
+          # 检查构建状态
+          if [[ "${{ needs.build-and-push.result }}" == "success" ]]; then
+            echo "✅ **所有服务构建成功**" >> summary.md
+          else
+            echo "❌ **部分服务构建失败**" >> summary.md
+          fi
+          
+          echo "" >> summary.md
+          echo "### 📦 构建的镜像" >> summary.md
+          echo "" >> summary.md
+          
+          # 根据服务类型列出镜像
+          SERVICES="${{ needs.check-trigger.outputs.services }}"
+          TAG="${{ needs.check-trigger.outputs.tag }}"
+          REGISTRY="${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}"
+          
+          if [[ "$SERVICES" == "all" ]]; then
+            SERVICES="app,gateway-service,songs-service,rating-service,recommendation-service,load-gen"
+          fi
+          
+          IFS=',' read -ra SERVICE_ARRAY <<< "$SERVICES"
+          for service in "${SERVICE_ARRAY[@]}"; do
+            case "$service" in
+              "app")
+                echo "- \`${REGISTRY}/frontend:${TAG}\`" >> summary.md
+                echo "- \`${REGISTRY}/server:${TAG}\`" >> summary.md
+                ;;
+              *)
+                echo "- \`${REGISTRY}/${service}:${TAG}\`" >> summary.md
+                ;;
+            esac
+          done
+          
+          echo "" >> summary.md
+          echo "### 📋 使用说明" >> summary.md
+          echo "" >> summary.md
+          echo "\`\`\`bash" >> summary.md
+          echo "# 拉取镜像示例" >> summary.md
+          echo "docker pull ${REGISTRY}/frontend:${TAG}" >> summary.md
+          echo "docker pull ${REGISTRY}/gateway-service:${TAG}" >> summary.md
+          echo "" >> summary.md
+          echo "# 运行示例" >> summary.md
+          echo "docker run --rm ${REGISTRY}/gateway-service:${TAG}" >> summary.md
+          echo "\`\`\`" >> summary.md
+          
+          echo "" >> summary.md
+          echo "---" >> summary.md
+          echo "*构建时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')*" >> summary.md
+          echo "*构建ID: [\`${{ github.run_id }}\`](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})*" >> summary.md
+
+      - name: Comment on issue with results
+        if: needs.check-trigger.outputs.issue_number != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('summary.md', 'utf8');
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ needs.check-trigger.outputs.issue_number }},
+              body: summary
+            });
+
+      - name: Add to job summary
+        run: |
+          cat summary.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Check final status
+        run: |
+          if [[ "${{ needs.build-and-push.result }}" != "success" ]]; then
+            echo "❌ 构建过程中有失败的服务"
+            exit 1
+          else
+            echo "✅ 所有服务构建成功!"
+          fi
