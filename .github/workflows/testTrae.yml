@@ -39,8 +39,6 @@ env:
 # 权限配置
 permissions:
   contents: read
-  issues: write
-  pull-requests: write
 
 jobs:
   # 准备构建矩阵
@@ -65,30 +63,9 @@ jobs:
             SERVICES=$(echo '${{ github.event.inputs.services }}' | jq -R 'split(",") | map(select(length > 0) | gsub("^\\s+|\\s+$"; ""))')
             echo "构建指定服务: $SERVICES"
           else
-            # 检查文件变更来决定构建哪些服务
-            if [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "pull_request" ]; then
-              CHANGED_SERVICES='[]'
-              
-              # 检查每个服务是否有变更
-              for service in "app/frontend" "app/server" "gateway-service" "rating-service" "recommendation-service" "songs-service" "load-gen"; do
-                if git diff --name-only HEAD~1 HEAD | grep -q "^services/$service/"; then
-                  CHANGED_SERVICES=$(echo $CHANGED_SERVICES | jq ". + [\"$service\"]")
-                fi
-              done
-              
-              # 如果没有服务变更，构建所有服务
-              if [ "$CHANGED_SERVICES" = "[]" ]; then
-                SERVICES=$ALL_SERVICES
-                echo "没有检测到服务变更，构建所有服务"
-              else
-                SERVICES=$CHANGED_SERVICES
-                echo "检测到服务变更: $SERVICES"
-              fi
-            else
-              # 默认构建所有服务
-              SERVICES=$ALL_SERVICES
-              echo "构建所有服务"
-            fi
+            # 默认构建所有服务
+            SERVICES=$ALL_SERVICES
+            echo "构建所有服务"
           fi
           
           echo "matrix=$SERVICES" >> $GITHUB_OUTPUT
@@ -98,8 +75,6 @@ jobs:
         run: |
           if [ "${{ github.event.inputs.tag }}" != "" ]; then
             TAG="${{ github.event.inputs.tag }}"
-          elif [ "${{ github.event_name }}" = "pull_request" ]; then
-            TAG="pr-${{ github.event.number }}"
           else
             TAG="${GITHUB_SHA:0:8}"
           fi
@@ -142,7 +117,7 @@ jobs:
           driver-opts: network=host
           
       - name: 登录阿里云容器镜像服务
-        if: github.event.inputs.push_to_registry != 'false' && (github.event_name != 'pull_request')
+        if: github.event.inputs.push_to_registry != 'false'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.ACR_REGISTRY }}
@@ -162,7 +137,7 @@ jobs:
             type=sha,prefix={{branch}}-
             
       - name: 构建镜像 (仅测试)
-        if: github.event.inputs.push_to_registry == 'false' || github.event_name == 'pull_request'
+        if: github.event.inputs.push_to_registry == 'false'
         uses: docker/build-push-action@v5
         with:
           context: ./services/${{ matrix.service }}
@@ -179,7 +154,7 @@ jobs:
             SW_AGENT_JAVA_IMAGE=${{ env.SW_AGENT_JAVA_IMAGE }}
             
       - name: 构建并推送镜像
-        if: github.event.inputs.push_to_registry != 'false' && github.event_name != 'pull_request'
+        if: github.event.inputs.push_to_registry != 'false'
         uses: docker/build-push-action@v5
         id: build
         with:
@@ -204,7 +179,7 @@ jobs:
           echo "**标签:** ${{ needs.prepare.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
           echo "**镜像:** ${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/${{ matrix.service }}:${{ needs.prepare.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
           
-          if [ "${{ github.event.inputs.push_to_registry }}" != "false" ] && [ "${{ github.event_name }}" != "pull_request" ]; then
+          if [ "${{ github.event.inputs.push_to_registry }}" != "false" ]; then
             echo "**状态:** ✅ 已推送到阿里云容器服务" >> $GITHUB_STEP_SUMMARY
           else
             echo "**状态:** 🔍 仅构建测试，未推送" >> $GITHUB_STEP_SUMMARY
@@ -258,7 +233,7 @@ jobs:
           echo "## 🔗 镜像地址" >> build-report.md
           echo "" >> build-report.md
           
-          if [ "${{ github.event.inputs.push_to_registry }}" != "false" ] && [ "${{ github.event_name }}" != "pull_request" ]; then
+          if [ "${{ github.event.inputs.push_to_registry }}" != "false" ]; then
             echo "镜像已推送到阿里云容器服务：" >> build-report.md
             echo "" >> build-report.md
             echo "\`\`\`" >> build-report.md
@@ -277,39 +252,3 @@ jobs:
           name: build-report
           path: build-report.md
           retention-days: 30
-
-  # 通知构建结果到Issue (如果是通过issue触发的)
-  notify:
-    needs: [prepare, build, summary]
-    if: always() && github.event.issue.number
-    runs-on: ubuntu-latest
-    steps:
-      - name: 下载构建报告
-        uses: actions/download-artifact@v4
-        with:
-          name: build-report
-          
-      - name: 评论到Issue
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const report = fs.readFileSync('build-report.md', 'utf8');
-            
-            const comment = `${report}
-            
-            ---
-            
-            💡 **使用提示:**
-            - 使用 \`/build\` 命令重新构建所有服务
-            - 使用 \`/build service1,service2\` 构建指定服务
-            - 使用 \`/build --tag custom-tag\` 指定镜像标签
-            
-            🔗 [查看完整构建日志](${context.payload.repository.html_url}/actions/runs/${context.runId})`;
-            
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: comment
-            });
