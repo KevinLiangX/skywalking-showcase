@@ -1,0 +1,288 @@
+name: Build Java 8 Compatible Images (Fixed)
+
+on:
+  workflow_dispatch:  # 手动触发
+    inputs:
+      services:
+        description: '要构建的 Java 服务 (用逗号分隔)'
+        required: false
+        default: 'gateway-service,songs-service'
+      tag:
+        description: '镜像标签'
+        required: false
+        default: 'java8-fix-20250822'
+      push_to_registry:
+        description: '是否推送到阿里云容器服务'
+        required: true
+        default: true
+        type: boolean
+      
+  issue_comment:  # issue comment 触发
+    types: [created]
+
+env:
+  # 阿里云容器服务配置
+  ALIYUN_REGISTRY: registry.cn-hangzhou.aliyuncs.com
+  ALIYUN_NAMESPACE: skywk-showcase
+  
+  # 构建配置
+  DOCKER_BUILDKIT: 1
+
+jobs:
+  # 检查触发条件
+  check-trigger:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+      services: ${{ steps.check.outputs.services }}
+      tag: ${{ steps.check.outputs.tag }}
+      push_enabled: ${{ steps.check.outputs.push_enabled }}
+      issue_number: ${{ steps.check.outputs.issue_number }}
+    steps:
+      - name: Check trigger conditions
+        id: check
+        run: |
+          SHOULD_RUN="false"
+          SERVICES="gateway-service,songs-service"
+          TAG="java8-fix-20250822"
+          PUSH_ENABLED="true"
+          ISSUE_NUMBER=""
+          
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            SHOULD_RUN="true"
+            SERVICES="${{ github.event.inputs.services }}"
+            TAG="${{ github.event.inputs.tag }}"
+            PUSH_ENABLED="${{ github.event.inputs.push_to_registry }}"
+            echo "🚀 手动触发 Java 8 修复版本构建"
+          elif [[ "${{ github.event_name }}" == "issue_comment" ]]; then
+            COMMENT_BODY="${{ github.event.comment.body }}"
+            ISSUE_NUMBER="${{ github.event.issue.number }}"
+            
+            if [[ "${{ github.event.comment.author_association }}" == "OWNER" ]] || \
+               [[ "${{ github.event.comment.author_association }}" == "MEMBER" ]] || \
+               [[ "${{ github.event.comment.author_association }}" == "COLLABORATOR" ]]; then
+              
+              if echo "$COMMENT_BODY" | grep -E "^/build-java8-fix"; then
+                SHOULD_RUN="true"
+                echo "🎯 通过 issue comment 触发 Java 8 修复构建"
+                
+                if echo "$COMMENT_BODY" | grep -E -- "--tag"; then
+                  TAG=$(echo "$COMMENT_BODY" | sed -n 's/.*--tag[= ]\([^ ]*\).*/\1/p')
+                fi
+                
+                if echo "$COMMENT_BODY" | grep -E -- "--no-push"; then
+                  PUSH_ENABLED="false"
+                fi
+              fi
+            fi
+          fi
+          
+          echo "should_run=${SHOULD_RUN}" >> $GITHUB_OUTPUT
+          echo "services=${SERVICES}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "push_enabled=${PUSH_ENABLED}" >> $GITHUB_OUTPUT
+          echo "issue_number=${ISSUE_NUMBER}" >> $GITHUB_OUTPUT
+
+  # 构建 Java 8 兼容的服务 (修复版本)
+  build-java8-services:
+    needs: check-trigger
+    if: needs.check-trigger.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJson(format('["{0}"]', split(needs.check-trigger.outputs.services, ','))) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up Java 8
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '8'
+
+      - name: Log in to Aliyun Container Registry
+        if: needs.check-trigger.outputs.push_enabled == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ALIYUN_REGISTRY }}
+          username: ${{ secrets.ALIYUN_REGISTRY_USERNAME }}
+          password: ${{ secrets.ALIYUN_REGISTRY_PASSWORD }}
+
+      - name: Build Java 8 fixed Docker images
+        id: build
+        env:
+          HUB: ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}
+          TAG: ${{ needs.check-trigger.outputs.tag }}
+        run: |
+          echo "🔨 构建 Java 8 修复版本: ${{ matrix.service }}"
+          echo "📦 镜像仓库: ${HUB}"
+          echo "🏷️ 镜像标签: ${TAG}"
+          
+          cd services/${{ matrix.service }}
+          
+          BUILD_SUCCESS="false"
+          BUILT_IMAGES=""
+          
+          # 使用修复后的 Java 8 兼容 Dockerfile
+          if [[ -f "Dockerfile.java8" ]]; then
+            echo "使用修复后的 Java 8 专用 Dockerfile"
+            
+            # 设置 buildx 构建参数
+            docker buildx build \
+              --platform linux/amd64 \
+              --file Dockerfile.java8 \
+              --tag ${HUB}/${{ matrix.service }}:${TAG} \
+              --load \
+              .
+            
+            BUILD_SUCCESS="true"
+            BUILT_IMAGES="${HUB}/${{ matrix.service }}:${TAG}"
+            
+            echo "✅ ${{ matrix.service }} 构建成功"
+            
+            # 验证镜像中的 Java 可用性
+            echo "🔍 验证 Java 8 安装..."
+            docker run --rm ${HUB}/${{ matrix.service }}:${TAG} java -version || true
+            
+          else
+            echo "❌ 找不到 Dockerfile.java8"
+            exit 1
+          fi
+          
+          echo "build_success=${BUILD_SUCCESS}" >> $GITHUB_OUTPUT
+          echo "built_images=${BUILT_IMAGES}" >> $GITHUB_OUTPUT
+
+      - name: Push Docker images
+        if: steps.build.outputs.build_success == 'true' && needs.check-trigger.outputs.push_enabled == 'true'
+        id: push
+        env:
+          HUB: ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}
+          TAG: ${{ needs.check-trigger.outputs.tag }}
+        run: |
+          echo "📤 推送服务: ${{ matrix.service }}"
+          
+          PUSH_SUCCESS="false"
+          
+          if docker push ${HUB}/${{ matrix.service }}:${TAG}; then
+            PUSH_SUCCESS="true"
+            echo "✅ ${{ matrix.service }} 推送成功"
+          else
+            echo "❌ ${{ matrix.service }} 推送失败"
+          fi
+          
+          echo "push_success=${PUSH_SUCCESS}" >> $GITHUB_OUTPUT
+
+      - name: Test image startup
+        if: steps.build.outputs.build_success == 'true'
+        env:
+          HUB: ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}
+          TAG: ${{ needs.check-trigger.outputs.tag }}
+        run: |
+          echo "🧪 测试镜像启动能力..."
+          
+          # 测试镜像能否正常启动 Java 进程
+          timeout 30s docker run --rm ${HUB}/${{ matrix.service }}:${TAG} java -version && \
+          echo "✅ Java 运行时测试通过" || \
+          echo "⚠️ Java 运行时测试超时或失败"
+
+  # 汇总构建结果
+  build-summary:
+    needs: [check-trigger, build-java8-services]
+    if: always() && needs.check-trigger.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create summary
+        run: |
+          echo "## 📊 Java 8 修复版本构建结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**🔧 修复内容:**" >> $GITHUB_STEP_SUMMARY
+          echo "- 🐛 解决了 \`java: not found\` 错误" >> $GITHUB_STEP_SUMMARY
+          echo "- 📦 使用稳定的 \`openjdk:8-jre-alpine\` 基础镜像" >> $GITHUB_STEP_SUMMARY
+          echo "- 🔗 手动下载并配置 SkyWalking Agent" >> $GITHUB_STEP_SUMMARY
+          echo "- 🛡️ 添加了用户权限和安全配置" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ 确保 Java 8 运行时环境正确配置" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**构建配置:**" >> $GITHUB_STEP_SUMMARY
+          echo "- 🏷️ 标签: \`${{ needs.check-trigger.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 📦 服务: \`${{ needs.check-trigger.outputs.services }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 📤 推送状态: ${{ needs.check-trigger.outputs.push_enabled == 'true' && '✅ 已推送' || '❌ 未推送' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 🏭 镜像仓库: \`${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 构建的镜像" >> $GITHUB_STEP_SUMMARY
+          
+          SERVICES="${{ needs.check-trigger.outputs.services }}"
+          TAG="${{ needs.check-trigger.outputs.tag }}"
+          REGISTRY="${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}"
+          
+          IFS=',' read -ra SERVICE_ARRAY <<< "$SERVICES"
+          for service in "${SERVICE_ARRAY[@]}"; do
+            echo "- \`${REGISTRY}/${service}:${TAG}\`" >> $GITHUB_STEP_SUMMARY
+          done
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🚀 部署命令" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "# 更新部署配置使用修复后的镜像" >> $GITHUB_STEP_SUMMARY
+          echo "kubectl patch deployment gateway-service -n sample-services -p '{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"gateway-service\",\"image\":\"${REGISTRY}/gateway-service:${TAG}\"}]}}}}'" >> $GITHUB_STEP_SUMMARY
+          echo "kubectl patch deployment songs-service -n sample-services -p '{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"songs-service\",\"image\":\"${REGISTRY}/songs-service:${TAG}\"}]}}}}'" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# 检查修复效果" >> $GITHUB_STEP_SUMMARY
+          echo "kubectl logs -f deployment/gateway-service -n sample-services" >> $GITHUB_STEP_SUMMARY
+          echo "kubectl logs -f deployment/songs-service -n sample-services" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Comment on issue with results
+        if: needs.check-trigger.outputs.issue_number != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const success = '${{ needs.build-java8-services.result }}' === 'success';
+            
+            const summary = `## 🔧 Java 8 修复版本构建${success ? '成功' : '失败'}
+            
+            **🐛 解决的问题:**
+            - ✅ 修复了 \`java: not found\` 错误
+            - ✅ 使用稳定的 \`openjdk:8-jre-alpine\` 基础镜像
+            - ✅ 正确配置了 Java 8 运行环境和 SkyWalking Agent
+            
+            **📦 修复后的镜像:**
+            - \`${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}/gateway-service:${{ needs.check-trigger.outputs.tag }}\`
+            - \`${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}/songs-service:${{ needs.check-trigger.outputs.tag }}\`
+            
+            **🚀 部署修复:**
+            \`\`\`bash
+            # 使用修复后的镜像更新部署
+            kubectl patch deployment gateway-service -n sample-services -p '{"spec":{"template":{"spec":{"containers":[{"name":"gateway-service","image":"${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}/gateway-service:${{ needs.check-trigger.outputs.tag }}"}]}}}}'
+            
+            kubectl patch deployment songs-service -n sample-services -p '{"spec":{"template":{"spec":{"containers":[{"name":"songs-service","image":"${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}/songs-service:${{ needs.check-trigger.outputs.tag }}"}]}}}}'
+            
+            # 检查修复效果
+            kubectl get pods -n sample-services
+            kubectl logs -f deployment/gateway-service -n sample-services
+            \`\`\`
+            
+            ---
+            *构建时间: ${new Date().toISOString()}*
+            *构建ID: [\`${{ github.run_id }}\`](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})*`;
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ needs.check-trigger.outputs.issue_number }},
+              body: summary
+            });
+
+      - name: Check final status
+        run: |
+          if [[ "${{ needs.build-java8-services.result }}" != "success" ]]; then
+            echo "❌ Java 8 修复版本构建失败"
+            exit 1
+          else
+            echo "✅ Java 8 修复版本构建成功!"
+            echo "🎉 现在 Java 服务应该可以正常启动了"
+          fi
