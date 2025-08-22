@@ -191,6 +191,7 @@ jobs:
             SW_AGENT_NODEJS_FRONTEND_VERSION=${{ env.SW_AGENT_NODEJS_FRONTEND_VERSION }}
             SW_AGENT_NODEJS_BACKEND_VERSION=${{ env.SW_AGENT_NODEJS_BACKEND_VERSION }}
             SW_AGENT_GO_IMAGE=${{ env.SW_AGENT_GO_IMAGE }}
+            SW_AGENT_JAVA_IMAGE=${{ env.SW_AGENT_JAVA_IMAGE }}
             
       - name: 输出构建结果
         run: |
