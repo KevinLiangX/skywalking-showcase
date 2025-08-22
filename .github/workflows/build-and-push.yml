@@ -67,8 +67,8 @@ jobs:
       - name: 设置构建矩阵
         id: set-matrix
         run: |
-          # 定义所有可用的服务
-          ALL_SERVICES='["app/frontend", "app/server", "gateway-service", "rating-service", "recommendation-service", "songs-service", "load-gen"]'
+          # 定义所有可用的服务（使用正确的路径）
+          ALL_SERVICES='["app-frontend", "app-server", "gateway-service", "rating-service", "recommendation-service", "songs-service", "load-gen"]'
           
           # 检查是否指定了特定服务
           if [ "${{ github.event.inputs.services }}" != "" ]; then
@@ -81,9 +81,19 @@ jobs:
               CHANGED_SERVICES='[]'
               
               # 检查每个服务是否有变更
-              for service in "app/frontend" "app/server" "gateway-service" "rating-service" "recommendation-service" "songs-service" "load-gen"; do
-                if git diff --name-only HEAD~1 HEAD | grep -q "^services/$service/"; then
-                  CHANGED_SERVICES=$(echo $CHANGED_SERVICES | jq ". + [\"$service\"]")
+              for service_path in "app" "gateway-service" "rating-service" "recommendation-service" "songs-service" "load-gen"; do
+                if git diff --name-only HEAD~1 HEAD | grep -q "^services/$service_path/"; then
+                  if [ "$service_path" = "app" ]; then
+                    # 检查app子服务的具体变更
+                    if git diff --name-only HEAD~1 HEAD | grep -q "^services/app/frontend/"; then
+                      CHANGED_SERVICES=$(echo $CHANGED_SERVICES | jq ". + [\"app-frontend\"]")
+                    fi
+                    if git diff --name-only HEAD~1 HEAD | grep -q "^services/app/server/"; then
+                      CHANGED_SERVICES=$(echo $CHANGED_SERVICES | jq ". + [\"app-server\"]")
+                    fi
+                  else
+                    CHANGED_SERVICES=$(echo $CHANGED_SERVICES | jq ". + [\"$service_path\"]")
+                  fi
                 fi
               done
               
@@ -134,18 +144,38 @@ jobs:
           fetch-depth: 0  # 获取完整历史用于构建SkyWalking Agent
           
       - name: 设置Java环境 (仅Java服务)
-        if: contains(fromJson('["gateway-service", "recommendation-service", "songs-service"]'), matrix.service)
+        if: contains(fromJson('["gateway-service", "songs-service"]'), matrix.service)
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
           
       - name: 构建Java应用 (仅Java服务)
-        if: contains(fromJson('["gateway-service", "recommendation-service", "songs-service"]'), matrix.service)
+        if: contains(fromJson('["gateway-service", "songs-service"]'), matrix.service)
         run: |
           cd services/${{ matrix.service }}
           chmod +x gradlew
           ./gradlew build -x test
+          
+      - name: 设置Node.js环境 (仅Node.js服务)
+        if: contains(fromJson('["app-frontend", "app-server"]'), matrix.service)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: services/app/*/package-lock.json
+          
+      - name: 设置Python环境 (仅Python服务)
+        if: contains(fromJson('["recommendation-service", "load-gen"]'), matrix.service)
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          
+      - name: 设置Go环境 (仅Go服务)
+        if: matrix.service == 'rating-service'
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.19'
           
       - name: 设置Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -164,7 +194,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/${{ matrix.service }}
+          images: ${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/${{ steps.build-config.outputs.image_name }}
           tags: |
             type=raw,value=${{ needs.prepare.outputs.tag }}
             type=raw,value=latest,enable={{is_default_branch}}
@@ -172,11 +202,33 @@ jobs:
             type=ref,event=pr
             type=sha,prefix={{branch}}-
             
+      - name: 设置构建路径和Dockerfile
+        id: build-config
+        run: |
+          case "${{ matrix.service }}" in
+            "app-frontend")
+              echo "context=./services/app/frontend" >> $GITHUB_OUTPUT
+              echo "dockerfile=Dockerfile" >> $GITHUB_OUTPUT
+              echo "image_name=app/frontend" >> $GITHUB_OUTPUT
+              ;;
+            "app-server")
+              echo "context=./services/app/server" >> $GITHUB_OUTPUT
+              echo "dockerfile=Dockerfile" >> $GITHUB_OUTPUT
+              echo "image_name=app/server" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "context=./services/${{ matrix.service }}" >> $GITHUB_OUTPUT
+              echo "dockerfile=Dockerfile" >> $GITHUB_OUTPUT
+              echo "image_name=${{ matrix.service }}" >> $GITHUB_OUTPUT
+              ;;
+          esac
+          
       - name: 构建镜像 (仅测试)
         if: github.event.inputs.push_to_registry == 'false' || github.event_name == 'pull_request'
         uses: docker/build-push-action@v5
         with:
-          context: ./services/${{ matrix.service }}
+          context: ${{ steps.build-config.outputs.context }}
+          file: ${{ steps.build-config.outputs.context }}/${{ steps.build-config.outputs.dockerfile }}
           platforms: linux/amd64
           push: false
           tags: ${{ steps.meta.outputs.tags }}
@@ -194,8 +246,9 @@ jobs:
         uses: docker/build-push-action@v5
         id: build
         with:
-          context: ./services/${{ matrix.service }}
-          platforms: linux/amd64,linux/arm64
+          context: ${{ steps.build-config.outputs.context }}
+          file: ${{ steps.build-config.outputs.context }}/${{ steps.build-config.outputs.dockerfile }}
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -213,7 +266,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**服务:** ${{ matrix.service }}" >> $GITHUB_STEP_SUMMARY
           echo "**标签:** ${{ needs.prepare.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
-          echo "**镜像:** ${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/${{ matrix.service }}:${{ needs.prepare.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "**镜像:** ${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/${{ steps.build-config.outputs.image_name }}:${{ needs.prepare.outputs.tag }}" >> $GITHUB_STEP_SUMMARY
           
           if [ "${{ github.event.inputs.push_to_registry }}" != "false" ] && [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "**状态:** ✅ 已推送到阿里云容器服务" >> $GITHUB_STEP_SUMMARY
@@ -273,7 +326,7 @@ jobs:
             echo "镜像已推送到阿里云容器服务：" >> build-report.md
             echo "" >> build-report.md
             echo "\`\`\`" >> build-report.md
-            echo "$SERVICES" | jq -r '.[] | "${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/" + . + ":${{ needs.prepare.outputs.tag }}"' >> build-report.md
+            echo "$SERVICES" | jq -r '.[] | if . == "app-frontend" then "${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/app/frontend:${{ needs.prepare.outputs.tag }}" elif . == "app-server" then "${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/app/server:${{ needs.prepare.outputs.tag }}" else "${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/" + . + ":${{ needs.prepare.outputs.tag }}" end' >> build-report.md
             echo "\`\`\`" >> build-report.md
           else
             echo "镜像仅构建测试，未推送到注册表。" >> build-report.md
