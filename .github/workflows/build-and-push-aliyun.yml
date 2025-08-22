@@ -23,7 +23,7 @@ on:
 env:
   # 阿里云容器服务配置
   ALIYUN_REGISTRY: registry.cn-hangzhou.aliyuncs.com
-  ALIYUN_NAMESPACE: skywalking-showcase  # 修改为您的命名空间
+  ALIYUN_NAMESPACE: skywk-showcase  # 修改为您的命名空间
   
   # 构建配置
   DOCKER_BUILDKIT: 1
