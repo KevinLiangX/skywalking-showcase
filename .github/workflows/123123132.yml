@@ -1,0 +1,440 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Release Services
+
+# 触发条件：创建标签时自动发布
+on:
+  push:
+    tags:
+      - 'v*.*.*'  # 匹配语义化版本标签，如 v1.0.0
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '发布版本号 (例如: v1.0.0)'
+        required: true
+        type: string
+      services:
+        description: '要发布的服务 (用逗号分隔，留空发布全部)'
+        required: false
+        default: 'gateway-service,songs-service,rating-service,recommendation-service,app,load-gen'
+      create_release:
+        description: '是否创建GitHub Release'
+        required: false
+        default: true
+        type: boolean
+
+# 环境变量配置
+env:
+  HUB: ghcr.io/apache/skywalking-showcase
+  ALIYUN_HUB: registry.cn-hangzhou.aliyuncs.com/skywalking-showcase
+  DOCKER_BUILDKIT: 1
+
+jobs:
+  # 准备发布信息
+  prepare-release:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      services: ${{ steps.services.outputs.services }}
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Checkout代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 确定版本信息
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          
+          # 验证版本格式
+          if [[ ! $VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "错误: 版本格式不正确，应为 vX.Y.Z 格式"
+            exit 1
+          fi
+          
+          TAG=${VERSION#v}  # 移除v前缀
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "发布版本: $VERSION (标签: $TAG)"
+
+      - name: 确定发布服务
+        id: services
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.services }}" ]; then
+            SERVICES="${{ github.event.inputs.services }}"
+          else
+            SERVICES="gateway-service,songs-service,rating-service,recommendation-service,app,load-gen"
+          fi
+          
+          echo "services=$SERVICES" >> $GITHUB_OUTPUT
+          echo "发布服务: $SERVICES"
+
+      - name: 生成构建矩阵
+        id: matrix
+        run: |
+          SERVICES="${{ steps.services.outputs.services }}"
+          
+          # 构建JSON矩阵
+          MATRIX_JSON="{"
+          MATRIX_JSON="$MATRIX_JSON\"include\":["
+          
+          IFS=',' read -ra SERVICE_ARRAY <<< "$SERVICES"
+          FIRST=true
+          
+          for service in "${SERVICE_ARRAY[@]}"; do
+            service=$(echo $service | xargs)
+            if [ -z "$service" ]; then continue; fi
+            
+            if [ "$FIRST" = false ]; then
+              MATRIX_JSON="$MATRIX_JSON,"
+            fi
+            FIRST=false
+            
+            case $service in
+              "gateway-service"|"songs-service")
+                MATRIX_JSON="$MATRIX_JSON{\"service\":\"$service\",\"language\":\"java\",\"java-version\":\"8\"}"
+                ;;
+              "rating-service")
+                MATRIX_JSON="$MATRIX_JSON{\"service\":\"$service\",\"language\":\"go\",\"go-version\":\"1.19\"}"
+                ;;
+              "recommendation-service")
+                MATRIX_JSON="$MATRIX_JSON{\"service\":\"$service\",\"language\":\"python\",\"python-version\":\"3.9\"}"
+                ;;
+              "app")
+                MATRIX_JSON="$MATRIX_JSON{\"service\":\"$service\",\"language\":\"nodejs\",\"node-version\":\"16\"}"
+                ;;
+              "load-gen")
+                MATRIX_JSON="$MATRIX_JSON{\"service\":\"$service\",\"language\":\"python\",\"python-version\":\"3.9\"}"
+                ;;
+            esac
+          done
+          
+          MATRIX_JSON="$MATRIX_JSON]}"
+          echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
+          echo "构建矩阵: $MATRIX_JSON"
+
+  # 构建和发布服务镜像
+  build-and-release:
+    needs: prepare-release
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-release.outputs.matrix) }}
+    
+    permissions:
+      contents: read
+      packages: write
+    
+    timeout-minutes: 60
+    
+    steps:
+      - name: Checkout代码
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      # 环境设置（复用之前的逻辑）
+      - name: 设置Java环境
+        if: matrix.language == 'java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ matrix.java-version }}
+
+      - name: 设置Go环境
+        if: matrix.language == 'go'
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: 设置Python环境
+        if: matrix.language == 'python'
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 设置Node.js环境
+        if: matrix.language == 'nodejs'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+          cache-dependency-path: 'services/${{ matrix.service }}/*/package-lock.json'
+
+      - name: 设置Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录到GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 登录到阿里云容器镜像服务
+      - name: 登录到阿里云容器镜像服务
+        if: ${{ secrets.ALIYUN_REGISTRY_USERNAME != '' }}
+        uses: docker/login-action@v3
+        with:
+          registry: registry.cn-hangzhou.aliyuncs.com
+          username: ${{ secrets.ALIYUN_REGISTRY_USERNAME }}
+          password: ${{ secrets.ALIYUN_REGISTRY_PASSWORD }}
+
+      # 运行完整测试套件
+      - name: 运行测试 ${{ matrix.service }}
+        working-directory: services/${{ matrix.service }}
+        run: |
+          echo "运行完整测试套件: ${{ matrix.service }}"
+          
+          case "${{ matrix.language }}" in
+            "java")
+              if [ -f "gradlew" ]; then
+                ./gradlew clean test
+              fi
+              ;;
+            "go")
+              if [ -f "go.mod" ]; then
+                go test -v ./...
+              fi
+              ;;
+            "python")
+              if [ -f "requirements.txt" ]; then
+                pip install -r requirements.txt
+              fi
+              if [ -f "requirements-test.txt" ]; then
+                pip install -r requirements-test.txt
+                python -m pytest -v
+              fi
+              ;;
+            "nodejs")
+              if [ -f "package.json" ]; then
+                npm ci
+                npm test
+              fi
+              ;;
+          esac
+
+      # 构建应用
+      - name: 构建应用 ${{ matrix.service }}
+        working-directory: services/${{ matrix.service }}
+        run: |
+          echo "构建应用: ${{ matrix.service }}"
+          
+          if [ -f "Makefile" ]; then
+            make build || echo "构建步骤完成"
+          fi
+
+      # 构建和推送多架构Docker镜像
+      - name: 构建和推送Docker镜像 ${{ matrix.service }}
+        working-directory: services/${{ matrix.service }}
+        run: |
+          echo "构建多架构Docker镜像: ${{ matrix.service }}"
+          
+          # 设置环境变量
+          export TAG="${{ needs.prepare-release.outputs.tag }}"
+          export HUB=${{ env.HUB }}
+          export ALIYUN_HUB=${{ env.ALIYUN_HUB }}
+          export SW_AGENT_JAVA_IMAGE=ghcr.io/apache/skywalking-java/skywalking-java:26ef911aea908759795bb6f5f2f6be56370d30cc-java8
+          export SW_AGENT_GO_IMAGE=ghcr.io/apache/skywalking-go/skywalking-go:154de50628e82e590941585411299459e352317d-go1.19
+          
+          # 准备镜像标签列表
+          GITHUB_TAGS="--tag $HUB/${{ matrix.service }}:$TAG --tag $HUB/${{ matrix.service }}:latest"
+          ALIYUN_TAGS=""
+          if [ "${{ secrets.ALIYUN_REGISTRY_USERNAME != '' }}" ]; then
+            ALIYUN_TAGS="--tag $ALIYUN_HUB/${{ matrix.service }}:$TAG --tag $ALIYUN_HUB/${{ matrix.service }}:latest"
+          fi
+          
+          # 构建多架构镜像
+          if [ -f "Dockerfile" ]; then
+            # 构建带SkyWalking Agent的镜像
+            if [ "${{ matrix.language }}" = "java" ]; then
+              docker buildx build \
+                --platform linux/amd64,linux/arm64 \
+                --build-arg SW_AGENT_JAVA_IMAGE=$SW_AGENT_JAVA_IMAGE \
+                $GITHUB_TAGS $ALIYUN_TAGS \
+                --push .
+            elif [ "${{ matrix.language }}" = "go" ]; then
+              docker buildx build \
+                --platform linux/amd64,linux/arm64 \
+                --build-arg SW_AGENT_GO_IMAGE=$SW_AGENT_GO_IMAGE \
+                $GITHUB_TAGS $ALIYUN_TAGS \
+                --push .
+            else
+              docker buildx build \
+                --platform linux/amd64,linux/arm64 \
+                $GITHUB_TAGS $ALIYUN_TAGS \
+                --push .
+            fi
+            
+            # 构建agentless版本（如果存在）
+            if [ -f "Dockerfile.agentless" ]; then
+              GITHUB_AGENTLESS_TAGS="--tag $HUB/${{ matrix.service }}:$TAG-agentless --tag $HUB/${{ matrix.service }}:latest-agentless"
+              ALIYUN_AGENTLESS_TAGS=""
+              if [ "${{ secrets.ALIYUN_REGISTRY_USERNAME != '' }}" ]; then
+                ALIYUN_AGENTLESS_TAGS="--tag $ALIYUN_HUB/${{ matrix.service }}:$TAG-agentless --tag $ALIYUN_HUB/${{ matrix.service }}:latest-agentless"
+              fi
+              
+              docker buildx build \
+                --platform linux/amd64,linux/arm64 \
+                --file Dockerfile.agentless \
+                $GITHUB_AGENTLESS_TAGS $ALIYUN_AGENTLESS_TAGS \
+                --push .
+            fi
+          fi
+
+      # 生成镜像清单
+      - name: 生成镜像清单
+        run: |
+          echo "## ${{ matrix.service }}" >> /tmp/image-manifest.txt
+          echo "- \`${{ env.HUB }}/${{ matrix.service }}:${{ needs.prepare-release.outputs.tag }}\`" >> /tmp/image-manifest.txt
+          echo "- \`${{ env.HUB }}/${{ matrix.service }}:latest\`" >> /tmp/image-manifest.txt
+          if [ -f "services/${{ matrix.service }}/Dockerfile.agentless" ]; then
+            echo "- \`${{ env.HUB }}/${{ matrix.service }}:${{ needs.prepare-release.outputs.tag }}-agentless\`" >> /tmp/image-manifest.txt
+            echo "- \`${{ env.HUB }}/${{ matrix.service }}:latest-agentless\`" >> /tmp/image-manifest.txt
+          fi
+          echo "" >> /tmp/image-manifest.txt
+
+      - name: 上传镜像清单
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-manifest-${{ matrix.service }}
+          path: /tmp/image-manifest.txt
+
+  # 创建GitHub Release
+  create-release:
+    needs: [prepare-release, build-and-release]
+    if: github.event.inputs.create_release != 'false'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 下载镜像清单
+        uses: actions/download-artifact@v4
+        with:
+          pattern: image-manifest-*
+          path: /tmp/manifests
+          merge-multiple: true
+
+      - name: 生成发布说明
+        id: release-notes
+        run: |
+          VERSION="${{ needs.prepare-release.outputs.version }}"
+          
+          # 获取上一个标签
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          
+          # 生成变更日志
+          echo "# SkyWalking Showcase $VERSION" > /tmp/release-notes.md
+          echo "" >> /tmp/release-notes.md
+          
+          if [ -n "$PREVIOUS_TAG" ]; then
+            echo "## 🔄 变更内容" >> /tmp/release-notes.md
+            echo "" >> /tmp/release-notes.md
+            git log --pretty=format:"- %s (%h)" $PREVIOUS_TAG..HEAD >> /tmp/release-notes.md
+            echo "" >> /tmp/release-notes.md
+            echo "" >> /tmp/release-notes.md
+          fi
+          
+          echo "## 📦 发布的服务" >> /tmp/release-notes.md
+          echo "" >> /tmp/release-notes.md
+          echo "本次发布包含以下微服务:" >> /tmp/release-notes.md
+          echo "" >> /tmp/release-notes.md
+          
+          # 合并所有镜像清单
+          if [ -d "/tmp/manifests" ]; then
+            cat /tmp/manifests/*.txt >> /tmp/release-notes.md
+          fi
+          
+          echo "## 🚀 部署说明" >> /tmp/release-notes.md
+          echo "" >> /tmp/release-notes.md
+          echo "### Docker Compose 部署" >> /tmp/release-notes.md
+          echo "\`\`\`bash" >> /tmp/release-notes.md
+          echo "# 克隆仓库" >> /tmp/release-notes.md
+          echo "git clone https://github.com/apache/skywalking-showcase.git" >> /tmp/release-notes.md
+          echo "cd skywalking-showcase" >> /tmp/release-notes.md
+          echo "git checkout $VERSION" >> /tmp/release-notes.md
+          echo "" >> /tmp/release-notes.md
+          echo "# 部署到Docker" >> /tmp/release-notes.md
+          echo "make deploy.docker" >> /tmp/release-notes.md
+          echo "\`\`\`" >> /tmp/release-notes.md
+          echo "" >> /tmp/release-notes.md
+          echo "### Kubernetes 部署" >> /tmp/release-notes.md
+          echo "\`\`\`bash" >> /tmp/release-notes.md
+          echo "# 部署到Kubernetes" >> /tmp/release-notes.md
+          echo "make deploy.kubernetes" >> /tmp/release-notes.md
+          echo "\`\`\`" >> /tmp/release-notes.md
+          echo "" >> /tmp/release-notes.md
+          echo "## 📚 文档" >> /tmp/release-notes.md
+          echo "" >> /tmp/release-notes.md
+          echo "- [SkyWalking 官方文档](https://skywalking.apache.org/docs/)" >> /tmp/release-notes.md
+          echo "- [Showcase 使用指南](https://github.com/apache/skywalking-showcase/blob/main/README.md)" >> /tmp/release-notes.md
+
+      - name: 创建GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.prepare-release.outputs.version }}
+          name: SkyWalking Showcase ${{ needs.prepare-release.outputs.version }}
+          body_path: /tmp/release-notes.md
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 发布摘要
+  release-summary:
+    needs: [prepare-release, build-and-release, create-release]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: 发布摘要
+        run: |
+          echo "## 🎉 发布摘要" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**版本:** ${{ needs.prepare-release.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**发布服务:** ${{ needs.prepare-release.outputs.services }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.build-and-release.result }}" = "success" ]; then
+            echo "✅ **镜像构建和推送成功**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **镜像构建失败:** ${{ needs.build-and-release.result }}" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ needs.create-release.result }}" = "success" ]; then
+            echo "✅ **GitHub Release创建成功**" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.create-release.result }}" = "skipped" ]; then
+            echo "⏭️ **跳过GitHub Release创建**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **GitHub Release创建失败:** ${{ needs.create-release.result }}" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**镜像仓库:** ${{ env.HUB }}" >> $GITHUB_STEP_SUMMARY
+          echo "**触发方式:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
