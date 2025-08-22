@@ -1,0 +1,235 @@
+name: Build Server Service Only
+
+on:
+  workflow_dispatch:  # 手动触发
+    inputs:
+      tag:
+        description: '镜像标签'
+        required: false
+        default: 'v1.0.0'
+      push_to_registry:
+        description: '是否推送到阿里云容器服务'
+        required: true
+        default: true
+        type: boolean
+      
+  issue_comment:  # issue comment 触发
+    types: [created]
+
+env:
+  # 阿里云容器服务配置
+  ALIYUN_REGISTRY: registry.cn-hangzhou.aliyuncs.com
+  ALIYUN_NAMESPACE: skywk-showcase  # 使用您的命名空间
+  
+  # 构建配置
+  DOCKER_BUILDKIT: 1
+  BUILDKIT_PROGRESS: plain
+
+jobs:
+  # 检查触发条件
+  check-trigger:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+      tag: ${{ steps.check.outputs.tag }}
+      push_enabled: ${{ steps.check.outputs.push_enabled }}
+      issue_number: ${{ steps.check.outputs.issue_number }}
+    steps:
+      - name: Check trigger conditions
+        id: check
+        run: |
+          SHOULD_RUN="false"
+          TAG="v1.0.0"
+          PUSH_ENABLED="true"
+          ISSUE_NUMBER=""
+          
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            SHOULD_RUN="true"
+            TAG="${{ github.event.inputs.tag }}"
+            PUSH_ENABLED="${{ github.event.inputs.push_to_registry }}"
+            echo "🚀 手动触发 server 镜像构建"
+          elif [[ "${{ github.event_name }}" == "issue_comment" ]]; then
+            COMMENT_BODY="${{ github.event.comment.body }}"
+            ISSUE_NUMBER="${{ github.event.issue.number }}"
+            
+            if [[ "${{ github.event.comment.author_association }}" == "OWNER" ]] || \
+               [[ "${{ github.event.comment.author_association }}" == "MEMBER" ]] || \
+               [[ "${{ github.event.comment.author_association }}" == "COLLABORATOR" ]]; then
+              
+              if echo "$COMMENT_BODY" | grep -E "^/build-server"; then
+                SHOULD_RUN="true"
+                echo "🎯 通过 issue comment 触发 server 构建"
+                
+                if echo "$COMMENT_BODY" | grep -E -- "--tag"; then
+                  TAG=$(echo "$COMMENT_BODY" | sed -n 's/.*--tag[= ]\([^ ]*\).*/\1/p')
+                fi
+                
+                if echo "$COMMENT_BODY" | grep -E -- "--no-push"; then
+                  PUSH_ENABLED="false"
+                fi
+              fi
+            fi
+          fi
+          
+          echo "should_run=${SHOULD_RUN}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "push_enabled=${PUSH_ENABLED}" >> $GITHUB_OUTPUT
+          echo "issue_number=${ISSUE_NUMBER}" >> $GITHUB_OUTPUT
+
+  # 构建 server 服务
+  build-server:
+    needs: check-trigger
+    if: needs.check-trigger.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Log in to Aliyun Container Registry
+        if: needs.check-trigger.outputs.push_enabled == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ALIYUN_REGISTRY }}
+          username: ${{ secrets.ALIYUN_REGISTRY_USERNAME }}
+          password: ${{ secrets.ALIYUN_REGISTRY_PASSWORD }}
+
+      - name: Build Server Docker image
+        id: build
+        env:
+          HUB: ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}
+          TAG: ${{ needs.check-trigger.outputs.tag }}
+        run: |
+          echo "🔨 构建 server 服务"
+          echo "📦 镜像仓库: ${HUB}"
+          echo "🏷️ 镜像标签: ${TAG}"
+          
+          cd services/app/server
+          
+          BUILD_SUCCESS="false"
+          BUILT_IMAGES=""
+          
+          # 构建 server 镜像
+          if make docker.build; then
+            BUILD_SUCCESS="true"
+            echo "✅ server 构建成功"
+            BUILT_IMAGES="${HUB}/server:${TAG}"
+            
+            # 检查是否有 agentless 版本
+            if docker images | grep -q "${HUB}/server.*${TAG}-agentless"; then
+              BUILT_IMAGES="${BUILT_IMAGES},${HUB}/server:${TAG}-agentless"
+            fi
+          else
+            echo "❌ server 构建失败"
+          fi
+          
+          echo "build_success=${BUILD_SUCCESS}" >> $GITHUB_OUTPUT
+          echo "built_images=${BUILT_IMAGES}" >> $GITHUB_OUTPUT
+
+      - name: Push Server Docker image
+        if: steps.build.outputs.build_success == 'true' && needs.check-trigger.outputs.push_enabled == 'true'
+        id: push
+        env:
+          HUB: ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}
+          TAG: ${{ needs.check-trigger.outputs.tag }}
+        run: |
+          echo "📤 推送 server 服务"
+          
+          cd services/app/server
+          
+          PUSH_SUCCESS="false"
+          
+          if make docker.push; then
+            PUSH_SUCCESS="true"
+            echo "✅ server 推送成功"
+          else
+            echo "❌ server 推送失败"
+          fi
+          
+          echo "push_success=${PUSH_SUCCESS}" >> $GITHUB_OUTPUT
+
+      - name: Comment on issue with results
+        if: needs.check-trigger.outputs.issue_number != '' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const buildSuccess = '${{ steps.build.outputs.build_success }}' === 'true';
+            const pushSuccess = '${{ steps.push.outputs.push_success }}' === 'true';
+            const pushEnabled = '${{ needs.check-trigger.outputs.push_enabled }}' === 'true';
+            
+            let status = '❌ 失败';
+            let details = '';
+            
+            if (buildSuccess) {
+              if (pushEnabled) {
+                status = pushSuccess ? '✅ 成功' : '⚠️ 构建成功，推送失败';
+              } else {
+                status = '✅ 构建成功 (未推送)';
+              }
+              
+              details = `
+              **构建的镜像:**
+              - \`${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}/server:${{ needs.check-trigger.outputs.tag }}\`
+              
+              **使用方式:**
+              \`\`\`bash
+              # 拉取镜像
+              docker pull ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}/server:${{ needs.check-trigger.outputs.tag }}
+              
+              # 在 Kubernetes 中使用
+              image: ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}/server:${{ needs.check-trigger.outputs.tag }}
+              \`\`\``;
+            }
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ needs.check-trigger.outputs.issue_number }},
+              body: \`## 📦 Server 镜像构建结果
+              
+              **状态:** \${status}
+              **标签:** \`${{ needs.check-trigger.outputs.tag }}\`
+              **推送到阿里云:** \${pushEnabled ? '✅ 是' : '❌ 否'}
+              
+              \${details}
+              
+              ---
+              *构建时间: \${new Date().toISOString()}*
+              *构建ID: [\`${{ github.run_id }}\`](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})*\`
+            });
+
+      - name: Add to job summary
+        run: |
+          echo "## 📦 Server 镜像构建摘要" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**构建状态:** ${{ steps.build.outputs.build_success == 'true' && '✅ 成功' || '❌ 失败' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**推送状态:** ${{ steps.push.outputs.push_success == 'true' && '✅ 成功' || '❌ 失败' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**镜像标签:** \`${{ needs.check-trigger.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**构建的镜像:**" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}/server:${{ needs.check-trigger.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          
+      - name: Check final status
+        run: |
+          if [[ "${{ steps.build.outputs.build_success }}" != "true" ]]; then
+            echo "❌ Server 镜像构建失败"
+            exit 1
+          else
+            echo "✅ Server 镜像构建成功!"
+            
+            if [[ "${{ needs.check-trigger.outputs.push_enabled }}" == "true" ]]; then
+              if [[ "${{ steps.push.outputs.push_success }}" == "true" ]]; then
+                echo "✅ Server 镜像推送成功!"
+              else
+                echo "❌ Server 镜像推送失败"
+                exit 1
+              fi
+            fi
+          fi
