@@ -1,9 +1,9 @@
 # SkyWalking Showcase 镜像构建和推送工作流
 # 支持手动执行和issue评论触发，推送到阿里云容器服务
 
-name: Build and Push to Alibaba Cloud test trae
+name: Build and Push to Alibaba Cloud
 
-# 触发条件：手动执行、推送到主分支、PR
+# 触发条件：仅手动执行
 on:
   workflow_dispatch:
     inputs:
@@ -20,17 +20,6 @@ on:
         type: boolean
         required: false
         default: true
-  push:
-    branches: [ main, develop ]
-    paths:
-      - 'services/**'
-      - 'Dockerfile*'
-      - '.github/workflows/**'
-  pull_request:
-    branches: [ main ]
-    paths:
-      - 'services/**'
-      - 'Dockerfile*'
 
 # 环境变量配置
 env:
@@ -138,7 +127,7 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '17'
+          java-version: '8'
           
       - name: 构建Java应用 (仅Java服务)
         if: contains(fromJson('["gateway-service", "recommendation-service", "songs-service"]'), matrix.service)
