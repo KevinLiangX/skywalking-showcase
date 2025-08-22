@@ -30,7 +30,7 @@ on:
       services:
         description: '要发布的服务 (用逗号分隔，留空发布全部)'
         required: false
-        default: 'gateway-service,songs-service,rating-service,recommendation-service,app'
+        default: 'gateway-service,songs-service,rating-service,recommendation-service,app,load-gen'
       create_release:
         description: '是否创建GitHub Release'
         required: false
@@ -85,7 +85,7 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.services }}" ]; then
             SERVICES="${{ github.event.inputs.services }}"
           else
-            SERVICES="gateway-service,songs-service,rating-service,recommendation-service,app"
+            SERVICES="gateway-service,songs-service,rating-service,recommendation-service,app,load-gen"
           fi
           
           echo "services=$SERVICES" >> $GITHUB_OUTPUT
@@ -124,6 +124,9 @@ jobs:
                 ;;
               "app")
                 MATRIX_JSON="$MATRIX_JSON{\"service\":\"$service\",\"language\":\"nodejs\",\"node-version\":\"16\"}"
+                ;;
+              "load-gen")
+                MATRIX_JSON="$MATRIX_JSON{\"service\":\"$service\",\"language\":\"python\",\"python-version\":\"3.9\"}"
                 ;;
             esac
           done
@@ -192,7 +195,7 @@ jobs:
 
       # 登录到阿里云容器镜像服务
       - name: 登录到阿里云容器镜像服务
-        if: secrets.ALIYUN_REGISTRY_USERNAME != ''
+        if: ${{ secrets.ALIYUN_REGISTRY_USERNAME != '' }}
         uses: docker/login-action@v3
         with:
           registry: registry.cn-hangzhou.aliyuncs.com
@@ -259,7 +262,7 @@ jobs:
           # 准备镜像标签列表
           GITHUB_TAGS="--tag $HUB/${{ matrix.service }}:$TAG --tag $HUB/${{ matrix.service }}:latest"
           ALIYUN_TAGS=""
-          if [ "${{ secrets.ALIYUN_REGISTRY_USERNAME }}" != "" ]; then
+          if [ "${{ secrets.ALIYUN_REGISTRY_USERNAME != '' }}" ]; then
             ALIYUN_TAGS="--tag $ALIYUN_HUB/${{ matrix.service }}:$TAG --tag $ALIYUN_HUB/${{ matrix.service }}:latest"
           fi
           
@@ -289,7 +292,7 @@ jobs:
             if [ -f "Dockerfile.agentless" ]; then
               GITHUB_AGENTLESS_TAGS="--tag $HUB/${{ matrix.service }}:$TAG-agentless --tag $HUB/${{ matrix.service }}:latest-agentless"
               ALIYUN_AGENTLESS_TAGS=""
-              if [ "${{ secrets.ALIYUN_REGISTRY_USERNAME }}" != "" ]; then
+              if [ "${{ secrets.ALIYUN_REGISTRY_USERNAME != '' }}" ]; then
                 ALIYUN_AGENTLESS_TAGS="--tag $ALIYUN_HUB/${{ matrix.service }}:$TAG-agentless --tag $ALIYUN_HUB/${{ matrix.service }}:latest-agentless"
               fi
               
