@@ -169,11 +169,27 @@ jobs:
           case "${{ matrix.service }}" in
             "app-frontend")
               cd services/app/frontend
-              npm ci
+              # 检查是否存在 package-lock.json
+              if [ -f "package-lock.json" ]; then
+                echo "使用 npm ci 进行安装..."
+                npm ci
+              else
+                echo "缺少 package-lock.json，使用 npm install..."
+                npm install
+              fi
               ;;
             "app-server")
               cd services/app/server
-              npm ci
+              # 检查是否存在 package-lock.json
+              if [ -f "package-lock.json" ]; then
+                echo "使用 npm ci 进行安装..."
+                npm ci
+              else
+                echo "缺少 package-lock.json，使用 npm install..."
+                npm install
+                # 生成 package-lock.json 供后续使用
+                echo "生成 package-lock.json 文件"
+              fi
               ;;
           esac
           
