@@ -1,0 +1,274 @@
+name: Build Java 8 Compatible Images
+
+on:
+  workflow_dispatch:  # 手动触发
+    inputs:
+      services:
+        description: '要构建的 Java 服务 (用逗号分隔)'
+        required: false
+        default: 'gateway-service,songs-service'
+      tag:
+        description: '镜像标签'
+        required: false
+        default: 'java8-compatible'
+      push_to_registry:
+        description: '是否推送到阿里云容器服务'
+        required: true
+        default: true
+        type: boolean
+      
+  issue_comment:  # issue comment 触发
+    types: [created]
+
+env:
+  # 阿里云容器服务配置
+  ALIYUN_REGISTRY: registry.cn-hangzhou.aliyuncs.com
+  ALIYUN_NAMESPACE: skywk-showcase
+  
+  # 构建配置
+  DOCKER_BUILDKIT: 1
+
+jobs:
+  # 检查触发条件
+  check-trigger:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+      services: ${{ steps.check.outputs.services }}
+      tag: ${{ steps.check.outputs.tag }}
+      push_enabled: ${{ steps.check.outputs.push_enabled }}
+      issue_number: ${{ steps.check.outputs.issue_number }}
+    steps:
+      - name: Check trigger conditions
+        id: check
+        run: |
+          SHOULD_RUN="false"
+          SERVICES="gateway-service,songs-service"
+          TAG="java8-compatible"
+          PUSH_ENABLED="true"
+          ISSUE_NUMBER=""
+          
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            SHOULD_RUN="true"
+            SERVICES="${{ github.event.inputs.services }}"
+            TAG="${{ github.event.inputs.tag }}"
+            PUSH_ENABLED="${{ github.event.inputs.push_to_registry }}"
+            echo "🚀 手动触发 Java 8 兼容构建"
+          elif [[ "${{ github.event_name }}" == "issue_comment" ]]; then
+            COMMENT_BODY="${{ github.event.comment.body }}"
+            ISSUE_NUMBER="${{ github.event.issue.number }}"
+            
+            if [[ "${{ github.event.comment.author_association }}" == "OWNER" ]] || \
+               [[ "${{ github.event.comment.author_association }}" == "MEMBER" ]] || \
+               [[ "${{ github.event.comment.author_association }}" == "COLLABORATOR" ]]; then
+              
+              if echo "$COMMENT_BODY" | grep -E "^/build-java8"; then
+                SHOULD_RUN="true"
+                echo "🎯 通过 issue comment 触发 Java 8 构建"
+                
+                if echo "$COMMENT_BODY" | grep -E -- "--tag"; then
+                  TAG=$(echo "$COMMENT_BODY" | sed -n 's/.*--tag[= ]\([^ ]*\).*/\1/p')
+                fi
+                
+                if echo "$COMMENT_BODY" | grep -E -- "--no-push"; then
+                  PUSH_ENABLED="false"
+                fi
+              fi
+            fi
+          fi
+          
+          echo "should_run=${SHOULD_RUN}" >> $GITHUB_OUTPUT
+          echo "services=${SERVICES}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "push_enabled=${PUSH_ENABLED}" >> $GITHUB_OUTPUT
+          echo "issue_number=${ISSUE_NUMBER}" >> $GITHUB_OUTPUT
+
+  # 在 issue 中添加开始构建的评论
+  comment-start:
+    needs: check-trigger
+    if: needs.check-trigger.outputs.should_run == 'true' && needs.check-trigger.outputs.issue_number != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment on issue - Build started
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ needs.check-trigger.outputs.issue_number }},
+              body: `## 🚀 Java 8 兼容构建开始
+              
+              **构建配置:**
+              - 🏷️ 标签: \`${{ needs.check-trigger.outputs.tag }}\`
+              - 📦 服务: \`${{ needs.check-trigger.outputs.services }}\`
+              - 📤 推送到阿里云: ${{ needs.check-trigger.outputs.push_enabled == 'true' && '✅' || '❌' }}
+              - 🔗 [查看构建进度](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+              
+              ⏳ 构建中，这将解决 Java 版本兼容性问题...`
+            });
+
+  # 构建 Java 8 兼容的服务
+  build-java8-services:
+    needs: [check-trigger, comment-start]
+    if: always() && needs.check-trigger.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJson(format('["{0}"]', needs.check-trigger.outputs.services)) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up Java 8
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '8'
+
+      - name: Log in to Aliyun Container Registry
+        if: needs.check-trigger.outputs.push_enabled == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ALIYUN_REGISTRY }}
+          username: ${{ secrets.ALIYUN_REGISTRY_USERNAME }}
+          password: ${{ secrets.ALIYUN_REGISTRY_PASSWORD }}
+
+      - name: Build Java 8 compatible Docker images
+        id: build
+        env:
+          HUB: ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}
+          TAG: ${{ needs.check-trigger.outputs.tag }}
+        run: |
+          echo "🔨 构建 Java 8 兼容的服务: ${{ matrix.service }}"
+          echo "📦 镜像仓库: ${HUB}"
+          echo "🏷️ 镜像标签: ${TAG}"
+          
+          cd services/${{ matrix.service }}
+          
+          BUILD_SUCCESS="false"
+          BUILT_IMAGES=""
+          
+          # 使用 Java 8 兼容的 Dockerfile
+          if [[ -f "Dockerfile.java8" ]]; then
+            echo "使用 Java 8 专用 Dockerfile"
+            docker build -f Dockerfile.java8 -t ${HUB}/${{ matrix.service }}:${TAG} .
+            BUILD_SUCCESS="true"
+            BUILT_IMAGES="${HUB}/${{ matrix.service }}:${TAG}"
+          else
+            echo "❌ 找不到 Dockerfile.java8"
+            exit 1
+          fi
+          
+          echo "build_success=${BUILD_SUCCESS}" >> $GITHUB_OUTPUT
+          echo "built_images=${BUILT_IMAGES}" >> $GITHUB_OUTPUT
+
+      - name: Push Docker images
+        if: steps.build.outputs.build_success == 'true' && needs.check-trigger.outputs.push_enabled == 'true'
+        id: push
+        env:
+          HUB: ${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}
+          TAG: ${{ needs.check-trigger.outputs.tag }}
+        run: |
+          echo "📤 推送服务: ${{ matrix.service }}"
+          
+          PUSH_SUCCESS="false"
+          
+          if docker push ${HUB}/${{ matrix.service }}:${TAG}; then
+            PUSH_SUCCESS="true"
+            echo "✅ ${{ matrix.service }} 推送成功"
+          else
+            echo "❌ ${{ matrix.service }} 推送失败"
+          fi
+          
+          echo "push_success=${PUSH_SUCCESS}" >> $GITHUB_OUTPUT
+
+  # 汇总构建结果
+  build-summary:
+    needs: [check-trigger, build-java8-services]
+    if: always() && needs.check-trigger.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create summary
+        run: |
+          echo "## 📊 Java 8 兼容构建结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**构建配置:**" >> $GITHUB_STEP_SUMMARY
+          echo "- 🏷️ 标签: \`${{ needs.check-trigger.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 📦 服务: \`${{ needs.check-trigger.outputs.services }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 📤 推送状态: ${{ needs.check-trigger.outputs.push_enabled == 'true' && '✅ 已推送' || '❌ 未推送' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 🏭 镜像仓库: \`${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ✨ 解决的问题" >> $GITHUB_STEP_SUMMARY
+          echo "- 🐛 修复了 Java 版本兼容性问题 (UnsupportedClassVersionError)" >> $GITHUB_STEP_SUMMARY
+          echo "- 📦 使用 Java 8 编译和运行，确保版本一致性" >> $GITHUB_STEP_SUMMARY
+          echo "- 🎯 可以在 Java 8 运行环境中正常启动" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 构建的镜像" >> $GITHUB_STEP_SUMMARY
+          
+          SERVICES="${{ needs.check-trigger.outputs.services }}"
+          TAG="${{ needs.check-trigger.outputs.tag }}"
+          REGISTRY="${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}"
+          
+          IFS=',' read -ra SERVICE_ARRAY <<< "$SERVICES"
+          for service in "${SERVICE_ARRAY[@]}"; do
+            echo "- \`${REGISTRY}/${service}:${TAG}\`" >> $GITHUB_STEP_SUMMARY
+          done
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🚀 部署命令" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "# 更新部署配置使用新的 Java 8 兼容镜像" >> $GITHUB_STEP_SUMMARY
+          echo "sed -i 's/:latest/:${TAG}/g' deploy/kubernetes/showcase-for-existing-env.yaml" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# 重新部署" >> $GITHUB_STEP_SUMMARY
+          echo "kubectl apply -f deploy/kubernetes/showcase-for-existing-env.yaml" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Comment on issue with results
+        if: needs.check-trigger.outputs.issue_number != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const summary = `## 📊 Java 8 兼容构建完成
+            
+            **构建状态:** ${{ needs.build-java8-services.result == 'success' && '✅ 成功' || '❌ 失败' }}
+            
+            **解决的问题:**
+            - 🐛 修复了 Java 版本兼容性问题 (UnsupportedClassVersionError)
+            - 📦 使用 Java 8 编译和运行，确保版本一致性
+            - 🎯 现在可以在 Java 8 运行环境中正常启动
+            
+            **构建的镜像:**
+            - \`${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}/gateway-service:${{ needs.check-trigger.outputs.tag }}\`
+            - \`${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}/songs-service:${{ needs.check-trigger.outputs.tag }}\`
+            
+            **下一步操作:**
+            \`\`\`bash
+            # 使用新的 Java 8 兼容镜像重新部署
+            sed -i 's/:latest/:${{ needs.check-trigger.outputs.tag }}/g' deploy/kubernetes/showcase-for-existing-env.yaml
+            kubectl apply -f deploy/kubernetes/showcase-for-existing-env.yaml
+            \`\`\`
+            
+            ---
+            *构建时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')*`;
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ needs.check-trigger.outputs.issue_number }},
+              body: summary
+            });
+
+      - name: Check final status
+        run: |
+          if [[ "${{ needs.build-java8-services.result }}" != "success" ]]; then
+            echo "❌ Java 8 兼容构建失败"
+            exit 1
+          else
+            echo "✅ Java 8 兼容构建成功!"
+          fi
