@@ -148,7 +148,7 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '17'
+          java-version: '8'
           
       - name: 构建Java应用 (仅Java服务)
         if: contains(fromJson('["gateway-service", "songs-service"]'), matrix.service)
@@ -162,8 +162,20 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '18'
-          cache: 'npm'
-          cache-dependency-path: services/app/*/package-lock.json
+          
+      - name: 安装Node.js依赖 (仅Node.js服务)
+        if: contains(fromJson('["app-frontend", "app-server"]'), matrix.service)
+        run: |
+          case "${{ matrix.service }}" in
+            "app-frontend")
+              cd services/app/frontend
+              npm ci
+              ;;
+            "app-server")
+              cd services/app/server
+              npm ci
+              ;;
+          esac
           
       - name: 设置Python环境 (仅Python服务)
         if: contains(fromJson('["recommendation-service", "load-gen"]'), matrix.service)
@@ -176,6 +188,20 @@ jobs:
         uses: actions/setup-go@v4
         with:
           go-version: '1.19'
+          cache: false  # 禁用自动缓存，手动处理
+          
+      - name: 初始化Go模块 (仅Go服务)
+        if: matrix.service == 'rating-service'
+        run: |
+          cd services/rating-service
+          # 初始化Go模块如果不存在
+          if [ ! -s go.mod ]; then
+            go mod init rating-service
+            go mod tidy
+          fi
+          # 检查和更新依赖
+          go mod download
+          go mod tidy
           
       - name: 设置Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -190,6 +216,27 @@ jobs:
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
           
+      - name: 设置构建路径和Dockerfile
+        id: build-config
+        run: |
+          case "${{ matrix.service }}" in
+            "app-frontend")
+              echo "context=./services/app/frontend" >> $GITHUB_OUTPUT
+              echo "dockerfile=Dockerfile" >> $GITHUB_OUTPUT
+              echo "image_name=app-frontend" >> $GITHUB_OUTPUT
+              ;;
+            "app-server")
+              echo "context=./services/app/server" >> $GITHUB_OUTPUT
+              echo "dockerfile=Dockerfile" >> $GITHUB_OUTPUT
+              echo "image_name=app-server" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "context=./services/${{ matrix.service }}" >> $GITHUB_OUTPUT
+              echo "dockerfile=Dockerfile" >> $GITHUB_OUTPUT
+              echo "image_name=${{ matrix.service }}" >> $GITHUB_OUTPUT
+              ;;
+          esac
+          
       - name: 提取镜像元数据
         id: meta
         uses: docker/metadata-action@v5
@@ -201,27 +248,6 @@ jobs:
             type=ref,event=branch
             type=ref,event=pr
             type=sha,prefix={{branch}}-
-            
-      - name: 设置构建路径和Dockerfile
-        id: build-config
-        run: |
-          case "${{ matrix.service }}" in
-            "app-frontend")
-              echo "context=./services/app/frontend" >> $GITHUB_OUTPUT
-              echo "dockerfile=Dockerfile" >> $GITHUB_OUTPUT
-              echo "image_name=app/frontend" >> $GITHUB_OUTPUT
-              ;;
-            "app-server")
-              echo "context=./services/app/server" >> $GITHUB_OUTPUT
-              echo "dockerfile=Dockerfile" >> $GITHUB_OUTPUT
-              echo "image_name=app/server" >> $GITHUB_OUTPUT
-              ;;
-            *)
-              echo "context=./services/${{ matrix.service }}" >> $GITHUB_OUTPUT
-              echo "dockerfile=Dockerfile" >> $GITHUB_OUTPUT
-              echo "image_name=${{ matrix.service }}" >> $GITHUB_OUTPUT
-              ;;
-          esac
           
       - name: 构建镜像 (仅测试)
         if: github.event.inputs.push_to_registry == 'false' || github.event_name == 'pull_request'
@@ -326,7 +352,7 @@ jobs:
             echo "镜像已推送到阿里云容器服务：" >> build-report.md
             echo "" >> build-report.md
             echo "\`\`\`" >> build-report.md
-            echo "$SERVICES" | jq -r '.[] | if . == "app-frontend" then "${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/app/frontend:${{ needs.prepare.outputs.tag }}" elif . == "app-server" then "${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/app/server:${{ needs.prepare.outputs.tag }}" else "${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/" + . + ":${{ needs.prepare.outputs.tag }}" end' >> build-report.md
+            echo "$SERVICES" | jq -r '.[] | if . == "app-frontend" then "${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/app-frontend:${{ needs.prepare.outputs.tag }}" elif . == "app-server" then "${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/app-server:${{ needs.prepare.outputs.tag }}" else "${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/" + . + ":${{ needs.prepare.outputs.tag }}" end' >> build-report.md
             echo "\`\`\`" >> build-report.md
           else
             echo "镜像仅构建测试，未推送到注册表。" >> build-report.md
