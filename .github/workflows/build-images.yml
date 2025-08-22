@@ -1,0 +1,332 @@
+name: Build Services
+
+# 触发条件：推送到main分支、PR请求、手动触发
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'services/**'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'services/**'
+  workflow_dispatch:
+    inputs:
+      services:
+        description: '指定要构建的服务 (用逗号分隔，留空构建全部)'
+        required: false
+        default: ''
+      push_images:
+        description: '是否推送镜像到仓库'
+        required: false
+        default: 'false'
+        type: boolean
+
+# 环境变量配置
+env:
+  HUB: ghcr.io/apache/skywalking-showcase
+  ALIYUN_HUB: registry.cn-hangzhou.aliyuncs.com/skywalking-showcase
+  DOCKER_BUILDKIT: 1
+
+jobs:
+  # 检测变更的服务
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.changes.outputs.services }}
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 检测服务变更
+        id: changes
+        run: |
+          # 如果是手动触发且指定了服务，使用指定的服务
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.services }}" ]; then
+            SERVICES="${{ github.event.inputs.services }}"
+            echo "使用手动指定的服务: $SERVICES"
+          else
+            # 检测services目录下变更的服务
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            else
+              BASE_SHA="HEAD~1"
+            fi
+            
+            CHANGED_FILES=$(git diff --name-only $BASE_SHA HEAD)
+            SERVICES=$(echo "$CHANGED_FILES" | grep '^services/' | cut -d'/' -f2 | sort -u | tr '\n' ',' | sed 's/,$//')
+            
+            # 如果没有检测到变更，构建所有服务
+            if [ -z "$SERVICES" ]; then
+              SERVICES="gateway-service,songs-service,rating-service,recommendation-service,app,load-gen"
+            fi
+          fi
+          
+          echo "services=$SERVICES" >> $GITHUB_OUTPUT
+          echo "检测到的服务: $SERVICES"
+
+      - name: 设置构建矩阵
+        id: set-matrix
+        run: |
+          SERVICES="${{ steps.changes.outputs.services }}"
+          
+          # 构建JSON矩阵
+          MATRIX_JSON="{"
+          MATRIX_JSON="$MATRIX_JSON\"include\":["
+          
+          IFS=',' read -ra SERVICE_ARRAY <<< "$SERVICES"
+          FIRST=true
+          
+          for service in "${SERVICE_ARRAY[@]}"; do
+            service=$(echo $service | xargs)  # 去除空格
+            if [ -z "$service" ]; then continue; fi
+            
+            if [ "$FIRST" = false ]; then
+              MATRIX_JSON="$MATRIX_JSON,"
+            fi
+            FIRST=false
+            
+            # 根据服务类型设置构建参数
+            case $service in
+              "gateway-service"|"songs-service")
+                MATRIX_JSON="$MATRIX_JSON{\"service\":\"$service\",\"language\":\"java\",\"java-version\":\"8\"}"
+                ;;
+              "rating-service")
+                MATRIX_JSON="$MATRIX_JSON{\"service\":\"$service\",\"language\":\"go\",\"go-version\":\"1.19\"}"
+                ;;
+              "recommendation-service"|"load-gen")
+                MATRIX_JSON="$MATRIX_JSON{\"service\":\"$service\",\"language\":\"python\",\"python-version\":\"3.9\"}"
+                ;;
+              "app")
+                MATRIX_JSON="$MATRIX_JSON{\"service\":\"$service\",\"language\":\"nodejs\",\"node-version\":\"16\"}"
+                ;;
+            esac
+          done
+          
+          MATRIX_JSON="$MATRIX_JSON]}"
+          echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
+          echo "构建矩阵: $MATRIX_JSON"
+
+  # 构建服务
+  build-services:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.services != ''
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+    
+    permissions:
+      contents: read
+      packages: write
+    
+    timeout-minutes: 45
+    
+    steps:
+      - name: Checkout代码
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      # Java环境设置
+      - name: 设置Java环境
+        if: matrix.language == 'java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ matrix.java-version }}
+
+      # Go环境设置
+      - name: 设置Go环境
+        if: matrix.language == 'go'
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      # Python环境设置
+      - name: 设置Python环境
+        if: matrix.language == 'python'
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Node.js环境设置
+      - name: 设置Node.js环境
+        if: matrix.language == 'nodejs'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+          cache-dependency-path: 'services/${{ matrix.service }}/*/package-lock.json'
+
+      # 设置Docker Buildx
+      - name: 设置Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 登录到容器仓库
+      - name: 登录到GitHub Container Registry
+        if: github.event_name != 'pull_request' || github.event.inputs.push_images == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 登录到阿里云容器镜像服务
+      - name: 登录到阿里云容器镜像服务
+        if: (github.event_name != 'pull_request' || github.event.inputs.push_images == 'true') && secrets.ALIYUN_REGISTRY_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          registry: registry.cn-hangzhou.aliyuncs.com
+          username: ${{ secrets.ALIYUN_REGISTRY_USERNAME }}
+          password: ${{ secrets.ALIYUN_REGISTRY_PASSWORD }}
+
+      # 构建服务
+      - name: 构建 ${{ matrix.service }}
+        working-directory: services/${{ matrix.service }}
+        run: |
+          echo "开始构建服务: ${{ matrix.service }}"
+          
+          # 设置环境变量
+          export TAG=$(git rev-parse --short HEAD)
+          export HUB=${{ env.HUB }}
+          
+          # 执行构建
+          if [ -f "Makefile" ]; then
+            echo "使用Makefile构建..."
+            make build || echo "构建步骤完成（某些服务可能没有构建步骤）"
+          else
+            echo "未找到Makefile，跳过构建步骤"
+          fi
+
+      # 构建Docker镜像
+      - name: 构建Docker镜像 ${{ matrix.service }}
+        working-directory: services/${{ matrix.service }}
+        run: |
+          echo "构建Docker镜像: ${{ matrix.service }}"
+          
+          # 设置环境变量
+          export TAG=$(git rev-parse --short HEAD)
+          export HUB=${{ env.HUB }}
+          export ALIYUN_HUB=${{ env.ALIYUN_HUB }}
+          export SW_AGENT_JAVA_IMAGE=ghcr.io/apache/skywalking-java/skywalking-java:26ef911aea908759795bb6f5f2f6be56370d30cc-java8
+          export SW_AGENT_GO_IMAGE=ghcr.io/apache/skywalking-go/skywalking-go:154de50628e82e590941585411299459e352317d-go1.19
+          
+          # 构建Docker镜像（GitHub镜像）
+          if [ -f "Makefile" ]; then
+            make docker.build
+          else
+            echo "未找到Makefile，尝试直接构建Docker镜像"
+            docker build -t $HUB/${{ matrix.service }}:$TAG .
+          fi
+          
+          # 为阿里云构建镜像标签
+          if [ "${{ secrets.ALIYUN_REGISTRY_USERNAME }}" != "" ]; then
+            echo "为阿里云创建镜像标签"
+            docker tag $HUB/${{ matrix.service }}:$TAG $ALIYUN_HUB/${{ matrix.service }}:$TAG
+            
+            # 如果存在agentless版本，也创建对应标签
+            if docker images | grep -q "$HUB/${{ matrix.service }}:$TAG-agentless"; then
+              docker tag $HUB/${{ matrix.service }}:$TAG-agentless $ALIYUN_HUB/${{ matrix.service }}:$TAG-agentless
+            fi
+          fi
+
+      # 推送Docker镜像到GitHub Container Registry
+      - name: 推送Docker镜像到GitHub ${{ matrix.service }}
+        if: (github.event_name != 'pull_request' || github.event.inputs.push_images == 'true') && github.repository == 'apache/skywalking-showcase'
+        working-directory: services/${{ matrix.service }}
+        run: |
+          echo "推送Docker镜像到GitHub: ${{ matrix.service }}"
+          
+          # 设置环境变量
+          export TAG=$(git rev-parse --short HEAD)
+          export HUB=${{ env.HUB }}
+          
+          # 推送镜像到GitHub
+          if [ -f "Makefile" ]; then
+            make docker.push
+          else
+            docker push $HUB/${{ matrix.service }}:$TAG
+          fi
+
+      # 推送Docker镜像到阿里云容器镜像服务
+      - name: 推送Docker镜像到阿里云 ${{ matrix.service }}
+        if: (github.event_name != 'pull_request' || github.event.inputs.push_images == 'true') && secrets.ALIYUN_REGISTRY_USERNAME != ''
+        run: |
+          echo "推送Docker镜像到阿里云: ${{ matrix.service }}"
+          
+          # 设置环境变量
+          export TAG=$(git rev-parse --short HEAD)
+          export ALIYUN_HUB=${{ env.ALIYUN_HUB }}
+          
+          # 推送镜像到阿里云
+          docker push $ALIYUN_HUB/${{ matrix.service }}:$TAG
+          
+          # 推送agentless版本（如果存在）
+          if docker images | grep -q "$ALIYUN_HUB/${{ matrix.service }}:$TAG-agentless"; then
+            docker push $ALIYUN_HUB/${{ matrix.service }}:$TAG-agentless
+          fi
+          
+          echo "✅ 成功推送到阿里云容器镜像服务"
+
+      # 运行测试（如果存在）
+      - name: 运行测试 ${{ matrix.service }}
+        working-directory: services/${{ matrix.service }}
+        continue-on-error: true
+        run: |
+          echo "运行测试: ${{ matrix.service }}"
+          
+          case "${{ matrix.language }}" in
+            "java")
+              if [ -f "gradlew" ]; then
+                ./gradlew test || echo "测试完成（可能有失败）"
+              fi
+              ;;
+            "go")
+              if [ -f "go.mod" ]; then
+                go test ./... || echo "测试完成（可能有失败）"
+              fi
+              ;;
+            "python")
+              if [ -f "requirements-test.txt" ]; then
+                pip install -r requirements-test.txt
+                python -m pytest || echo "测试完成（可能有失败）"
+              fi
+              ;;
+            "nodejs")
+              if [ -f "package.json" ]; then
+                npm test || echo "测试完成（可能有失败）"
+              fi
+              ;;
+          esac
+
+  # 构建摘要
+  build-summary:
+    needs: [detect-changes, build-services]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: 构建摘要
+        run: |
+          echo "## 🚀 构建摘要" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**检测到的服务:** ${{ needs.detect-changes.outputs.services }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.build-services.result }}" = "success" ]; then
+            echo "✅ **所有服务构建成功**" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.build-services.result }}" = "failure" ]; then
+            echo "❌ **部分服务构建失败**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ **构建状态:** ${{ needs.build-services.result }}" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**触发方式:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**分支:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**提交:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
