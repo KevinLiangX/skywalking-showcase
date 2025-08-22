@@ -133,6 +133,20 @@ jobs:
         with:
           fetch-depth: 0  # 获取完整历史用于构建SkyWalking Agent
           
+      - name: 设置Java环境 (仅Java服务)
+        if: contains(fromJson('["gateway-service", "recommendation-service", "songs-service"]'), matrix.service)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          
+      - name: 构建Java应用 (仅Java服务)
+        if: contains(fromJson('["gateway-service", "recommendation-service", "songs-service"]'), matrix.service)
+        run: |
+          cd services/${{ matrix.service }}
+          chmod +x gradlew
+          ./gradlew build -x test
+          
       - name: 设置Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
